@@ -10,6 +10,7 @@ breed [HQs HQ]
 directed-link-breed [path-links path-link]
 undirected-link-breed [dummy-links dummy-link]
 directed-link-breed [convoi-links convoi-link]
+directed-link-breed [drone-links drone-link]
 
 globals [mapAlt solAlt basseAlt hauteAlt ; variables topologiques Z discretise: definit le niveau ou se trouvent toutes les informations de la carte (obstacles base etc.) car en 2D, niveau au sol ou se trouvent les agents, niveau basse altitude et niveau haute altitude
   base-patches base-entry base-central ; precache: definit ou se trouvent les patchs de la base d'atterrissage, le patch d'entree sur la piste d'atterrissage, et le patch ou doivent s'arreter les drones pour se recharger. Permet d'evaluer rapidement la distance et les besoins des drones (quand ils doivent rentrer a la base)
@@ -19,16 +20,17 @@ globals [mapAlt solAlt basseAlt hauteAlt ; variables topologiques Z discretise: 
   mission-completed? mission-failed?
   send-interval ; communication period
   is-movie-recording?
-  ]
+]
 
 rockets-own [
   origin
-  ]
+  cible
+]
 
 patches-own [
   obstacle? base? hangar? objectif? bridge?; variables topologiques au niveau mapAlt, permet de definir les patchs praticables et ceux qui sont des obstacles
   as-closed as-heuristic as-prev-pos ; variables temporaires pour calculer les chemins AStar (effaces a chaque calcul de plan)
-  ]
+]
 
 convois-own[
   incoming-queue
@@ -43,7 +45,9 @@ convois-own[
   dead?
   speed maxdir ; maximal speed of a car, and max angle
   last-send-time ; communication historical time-stamp
-  ]
+  suiviParDrone?
+  protecteur
+]
 
 enemies-own[
   incoming-queue
@@ -54,15 +58,23 @@ enemies-own[
   approach?
   mytarget
   mypath
-  ]
+  cpt-tick-enemy ; L'ennemi ne peut tirer que tous les 10 ticks au moins
+]
 
 drones-own[
   incoming-queue
+  beliefs
+  intentions
+  leader?
   dead?
   fuel
+  leader
   finished?
   speed maxdir
   rayon-vision
+  dronepath
+  suivreConvoi?
+  aProteger
 ]
 
 
@@ -118,7 +130,7 @@ to setup-globals
 
   set send-interval 10 ; in number of steps
 
- ; set dist-R-set []
+                       ; set dist-R-set []
 
   set is-movie-recording? false
 end
@@ -143,8 +155,7 @@ to setup-env
   ask patches with [pzcor = mapAlt][set pcolor green + (random-float 2) - 1]
 
   ; Montagnes
-  ask patches with [ pycor  < 5 and pycor > 2 and pzcor = mapAlt and pxcor < 5 and pxcor > 2 ][ set pcolor white set obstacle? true]
-
+  if nb-mountains > 0 [ ask n-of nb-mountains patches with [pzcor = mapAlt and pxcor > 7 and pycor > 7] [ask patches with [distance-nowrap myself < 3] [set pcolor grey set obstacle? true]] ]
 
   ; Rivieres
   if nb-rivers > 0 [
@@ -199,11 +210,11 @@ to setup-env
   ask one-of patches with[obstacle? = false and base? = false and hangar? = false and pxcor >= (max-pxcor / 2) and pycor >= (max-pycor / 2) and pzcor = mapAlt][set objectif? true ask patch-at 0 0 2 [set pcolor yellow]]
 
   ; Hangar (la ou les voitures du convois demarrent)
-  ask patches with[pzcor = mapAlt and pxcor >= 5 and pxcor < 7 and pycor >= 0 and pycor < 12][set pcolor 8 set hangar? true set obstacle? false]
+  ask patches with[pzcor = solAlt and pxcor >= 5 and pxcor < 7 and pycor >= 0 and pycor < 12][set pcolor 8 set hangar? true set obstacle? false]
 
   ; Base de decollage et atterrissage pour les drones
-  ask patches with[pzcor = mapAlt and pxcor >= 3 and pxcor < 5 and pycor >= 0 and pycor < 12][set pcolor 1 set base? true set hangar? false set obstacle? false] ; piste verticale
-  ask patches with[pzcor = mapAlt and pycor = 0 and pxcor >= 0 and pxcor < 18][set pcolor 1 set base? true set hangar? false set obstacle? false] ; piste horizontale
+  ask patches with[pzcor = solAlt and pxcor >= 3 and pxcor < 5 and pycor >= 0 and pycor < 12][set pcolor 1 set base? true set hangar? false set obstacle? false] ; piste verticale
+  ask patches with[pzcor = solAlt and pycor = 0 and pxcor >= 0 and pxcor < 18][set pcolor 1 set base? true set hangar? false set obstacle? false] ; piste horizontale
 
   ; Batiment (pour faire joli, ne sert a rien fonctionnellement)
   ask patches with[pzcor <= solAlt and pxcor >= 0 and pxcor < 3 and pycor >= 0 and pycor < 5][set pcolor 3 set obstacle? true set base? false set hangar? false] ; Batiment
@@ -220,7 +231,7 @@ to setup-enemies
       set shape "car"
       set color red
 
-     ; Init vars enemies
+      ; Init vars enemies
       set speed 0.05 * simu-speed
       set maxdir 10 * simu-speed
       set roll 0
@@ -231,10 +242,12 @@ to setup-enemies
       set mypath []
       set rayon-vision vision-enemy
       set heading one-of [ 0 90 180 270 ] ; Dans une direction aléatoire
+      set cpt-tick-enemy 0
+
     ]
 
     ask turtle-set enemies [
-      let rand one-of (patches with [not hangar? and pzcor = mapAlt and not obstacle? and not base? and not any? turtles-here])
+      let rand one-of (patches with [not hangar? and pzcor = solAlt and not obstacle? and not base? and not any? turtles-here])
       setxy [pxcor] of rand [pycor] of rand ; les ennemis n'apparaissent pas sur un obstacle
       set zcor solAlt
 
@@ -243,40 +256,72 @@ to setup-enemies
 end
 
 to setup-drones
+  if nb-drones > 0 [
+    ; base est la piste verticale : les drones décollent ici
+    let base patches with[pzcor = solAlt and pxcor >= 3 and pxcor < 5 and pycor >= 0 and pycor < 12]
+    let base-min-pxcor min [pxcor] of base
+    let base-max-pxcor max [pxcor] of base
+    let base-min-pycor min [pycor] of base
+    let base-max-pycor max [pycor] of base
 
-if nb-drones > 0 [
-  create-drones nb-drones
-  ask drones [
-    set shape "airplane"
-    set color cyan
 
-    set speed 0.05 * simu-speed
-    set maxdir 10 * simu-speed
-    set finished? false
-    set fuel 60
-    set roll 0
-    set pitch 0
-    set rayon-vision vision-drone
-    set heading random 360
+    create-drones nb-drones
+    ask drones [
+      set shape "airplane"
+      set color white
 
-  ]
-    ask turtle-set drones [
-      let rand one-of (patches with [pzcor > 0 and pzcor <= hauteAlt])
-      setxyz [pxcor] of rand [pycor] of rand [pzcor] of rand
+      set speed 0.06 * simu-speed
+      set maxdir 10 * simu-speed
+      set finished? false
+      set fuel 60
+      set roll 0
+      set size 2
+      set pitch 90
+      set rayon-vision vision-drone
+      set heading 0
+      set leader? false
+      set dronepath []
+      set intentions []
+      add-intention "set pitch pitch - 10" "pitch <= 0"
+      add-intention "fd speed" "pzcor = mapAlt + rayon-vision"
+      set leader nobody
+      set suivreConvoi? false
+      set incoming-queue []
+      set aProteger nobody
     ]
 
+    let first-drone min [who] of drones
 
-]
+    ask drone first-drone [
+      set leader? true
+      set color orange
+      move-to patch base-max-pxcor base-max-pycor 1
+    ]
+
+    if nb-drones > 1 [
+      ask turtle-set sort-on [who] drones with [who > first-drone]
+      [
+        ; lien entre les drones
+        create-drone-link-to turtle (who - 1)
+  ; On les place sur la base comme les voitures du convoi
+  ifelse (who - 1) mod 2 = 0 [ set xcor base-min-pxcor ] [ set xcor base-max-pxcor ] ; a gauche ou a droite selon le nombre (pair ou impair respectivement)
+  ifelse (first-drone mod 2 = 0) [ set ycor base-max-pycor - (floor ((who - first-drone) / 2) / (nb-drones / 2) * (base-max-pycor - base-min-pycor)) ] ; d'une rangee de plus en plus basse toutes les deux voitures
+  [ set ycor base-max-pycor - (floor ((who - first-drone + 1) / 2) / (nb-drones / 2) * (base-max-pycor - base-min-pycor)) ]
+  set zcor solAlt
+
+      ]
+    ]
+  ]
 end
 
 
 to setup-convois
   if nb-cars > 0 [
     ; get the size of the base to deploy the car accordingly
-    let base-min-pxcor min [pxcor] of (patches with [hangar? and pzcor = mapAlt])
-    let base-max-pxcor max [pxcor] of (patches with [hangar? and pzcor = mapAlt])
-    let base-min-pycor min [pycor] of (patches with [hangar? and pzcor = mapAlt])
-    let base-max-pycor max [pycor] of (patches with [hangar? and pzcor = mapAlt])
+    let base-min-pxcor min [pxcor] of (patches with [hangar? and pzcor = solAlt])
+    let base-max-pxcor max [pxcor] of (patches with [hangar? and pzcor = solAlt])
+    let base-min-pycor min [pycor] of (patches with [hangar? and pzcor = solAlt])
+    let base-max-pycor max [pycor] of (patches with [hangar? and pzcor = solAlt])
 
     ; creation des voitures du convoi et cortege
     create-convois nb-cars
@@ -289,7 +334,7 @@ to setup-convois
       ; Init des structures BDI
       set incoming-queue [] ; Do not change
 
-      ; Init vars convois
+                            ; Init vars convois
       set speed 0.05 * simu-speed
       set maxdir 10 * simu-speed
       set heading 0
@@ -301,6 +346,8 @@ to setup-convois
       set genlongpath? false
       set dead? false
       set energy convoi-energy
+      set suiviParDrone? false
+      set protecteur nobody
 
       ; Visu
       set label who ; display the car names
@@ -330,12 +377,12 @@ to setup-convois
       [
         ; we create a link between them
         create-convoi-link-to turtle (who - 1)
-        ;if who >= 4 and who mod 2 = 0 [ create-convoi-link-with turtle (who - 3) ]
+  ;if who >= 4 and who mod 2 = 0 [ create-convoi-link-with turtle (who - 3) ]
 
-        ; deploying
-        ifelse (who - 1) mod 2 = 0 [ set xcor base-min-pxcor ] [ set xcor base-max-pxcor ] ; a gauche ou a droite selon le nombre (pair ou impair respectivement)
-        set ycor base-max-pycor - (floor (who / 2) / (nb-cars / 2) * (base-max-pycor - base-min-pycor)) ; d'une rangee de plus en plus basse toutes les deux voitures
-        set zcor solAlt
+  ; deploying
+  ifelse (who - 1) mod 2 = 0 [ set xcor base-min-pxcor ] [ set xcor base-max-pxcor ] ; a gauche ou a droite selon le nombre (pair ou impair respectivement)
+  set ycor base-max-pycor - (floor (who / 2) / (nb-cars / 2) * (base-max-pycor - base-min-pycor)) ; d'une rangee de plus en plus basse toutes les deux voitures
+  set zcor solAlt
       ]
 
     ]
@@ -352,8 +399,7 @@ end
 ; Note2: on l'utilise avec le convoi mais on peut l'utiliser avec n'importe quel agent, c'est generique.
 ; Note3: limite en 2D pour cette application mais on peut facilement la modifier pour accepter la 3D (enlever les limites with [pzcor ...])
 to-report plan-astar [start goal longpath?] ; start et goal sont des patchs
-
-  ; Desactivation du refresh GUI (car calculs internes): Pour etre plus rapide, on dit a NetLogo qu'il peut calculer toute cette fonction sans avoir a updater le GUI (que des calculs internes), comme ca le slider de vitesse n'influencera pas la vitesse de ce code (sinon en slower ca met vraiment beaucoup de temps)
+                                            ; Desactivation du refresh GUI (car calculs internes): Pour etre plus rapide, on dit a NetLogo qu'il peut calculer toute cette fonction sans avoir a updater le GUI (que des calculs internes), comme ca le slider de vitesse n'influencera pas la vitesse de ce code (sinon en slower ca met vraiment beaucoup de temps)
   if not debug-verbose [no-display]
 
   ; INIT
@@ -406,8 +452,8 @@ to-report plan-astar [start goal longpath?] ; start et goal sont des patchs
 
       ; Dessin en live du chemin parcouru par astar
       if debug-verbose [
-      wait 0.01
-      ask pos [ set pcolor red ]
+        wait 0.01
+        ask pos [ set pcolor red ]
       ]
 
       ; Critere d'arret si reussite: on est sur le but donc on a trouve un chemin
@@ -418,7 +464,7 @@ to-report plan-astar [start goal longpath?] ; start et goal sont des patchs
       [
         ; Expansion du meilleur candidat (expansion = on ajoute les voisins dans la liste open, des noeuds a visiter)
         ask [neighbors6-nowrap with [pzcor = start-pzcor and as-closed = 0 and not obstacle? and not base?]] of pos [ ; On ne visite que les voisins au meme niveau (astar en 2D, mais on peut etendre ici au 3D facilement!) ET on ne l'a pas deja visite (as-closed = 0) ET il n'y a pas d'obstacle sur ce patch
-          ; Calcul du score f de ce voisin
+                                                                                                                      ; Calcul du score f de ce voisin
           let g2 g + as-cost
           let h2 as-heuristic
           let f2 g2 + h2
@@ -499,11 +545,21 @@ end
 
 ; Return the 6 neighbours without the world wrap
 to-report neighbors6-nowrap
-; reports neighbors-nowrap-n or the indicated size
-report neighbors6 with
-[ abs (pxcor - [pxcor] of myself) <= 1
-  and abs (pycor - [pycor] of myself) <= 1
-]
+  ; reports neighbors-nowrap-n or the indicated size
+  report neighbors6 with
+  [ abs (pxcor - [pxcor] of myself) <= 1
+    and abs (pycor - [pycor] of myself) <= 1
+  ]
+end
+
+
+
+; Si la voiture à proteger meurt -> 0
+; Si le convoi qui a la voiture à proteger arrive à destination -> 1
+to-report check-win
+  if  mission-failed? [ report 0 ]
+  if  mission-completed? [ report 1 ]
+  report -1
 end
 
 
@@ -514,7 +570,7 @@ end
 ; Procedure principale de gestion des convois
 to convois-think
 
-  if nb-cars > 0 [
+  if count convois > 0 [
 
     let first-car min [who] of convois
 
@@ -524,8 +580,8 @@ to convois-think
       ; Recalcule le chemin si nécessaire (par exemple au début de la simulation ou quand le convoi se sépare)
       ; Note: on est oblige de le faire en dehors du ask sinon on ne peut pas acceder a tous les patchs
       if empty? as-path or length as-path < (id + 1) or empty? (item id as-path) [ ; s'il n'y a pas encore de chemin du tout, ou pas de chemin pour cette voiture, on cree un plan AStar
-        ; Cree le plan AStar (attention a ca que le patch start soit au niveau ou il y a les obstacles, ici pzcor = mapAlt pour les obstacles)
-        let start-patch min-one-of (patches with [pzcor = mapAlt and not obstacle?]) [distance ?] ; on s'assure de choisir comme patch de depart un patch libre sans obstacle, sinon quand on split un convoi il se peut qu'il soit sur un obstacle et qu'il ne puisse jamais generer de chemin
+                                                                                   ; Cree le plan AStar (attention a ca que le patch start soit au niveau ou il y a les obstacles, ici pzcor = mapAlt pour les obstacles)
+        let start-patch min-one-of (patches with [pzcor = solAlt and not obstacle?]) [distance ?] ; on s'assure de choisir comme patch de depart un patch libre sans obstacle, sinon quand on split un convoi il se peut qu'il soit sur un obstacle et qu'il ne puisse jamais generer de chemin
         let new-path plan-astar ([patch-at 0 0 (pzcor * -1)] of start-patch) (one-of patches with [objectif?]) ([genlongpath?] of ?)
         ; S'il n'y a pas de plan et qu'on a essayé de trouver un long chemin, on attend la prochaine iteration et on reessaie mais avec un plan court
         if empty? new-path and [genlongpath?] of ? [ ask ? [ set genlongpath? false ] ]
@@ -538,20 +594,33 @@ to convois-think
           set as-path replace-item id as-path new-path
         ]
       ]
+      ; Si un leader voit un ennemi, changement de trajectoire
+      ;let vision [patches in-radius-nowrap vision-convoi with [ pzcor = solAlt ]] of ?
+     ; if any? enemies-on vision  [
+        ;Recuperer l'ennemi le plus proche
+       ; let min-enemy [patch-here] of min-one-of (enemies-on vision) [distance ?]
+       ; show min-enemy
+       ; while [member? min-enemy plan-astar [patch-here] of ? one-of patches with [objectif?] true]
+       ; [ let path plan-astar [patch-here] of ? one-of patches with [objectif?] true
+       ;   ask ? [ set as-path replace-item id as-path path ]
+       ; ]
+     ; ]
+      ; Si je reçois un message de la part d'une voiture, changement de trajectoire
+      ; Si je reçois un message de la part des drones, je change de trajectoire
     ]
 
     ; Deplacement des leaders sur le chemin AStar
     ask convois with [leader? and not finished? and not dead?] [ ; Tant qu'on n'a pas atteint le but
-      ;move-convoi-naive ; deplacement naif sans AStar
+                                                                 ;move-convoi-naive ; deplacement naif sans AStar
 
-      ; Recupere le plan AStar
+                                                                 ; Recupere le plan AStar
       let my-as-path item (who - first-car) as-path
       if not empty? my-as-path [
         ; Deplacement par waypoints: on se deplace jusqu'au prochain patch du chemin jusqu'à l'atteindre
         let next-patch first my-as-path
         let zz pzcor
         set next-patch [patch-at 0 0 (zz - pzcor)] of next-patch ; mise a niveau de pzcor au cas ou le chemin a ete calculé sur un autre plan
-        ; Deplacement vers le prochain waypoint
+                                                                 ; Deplacement vers le prochain waypoint
         if next-patch != patch-here [move-convoi next-patch false false]
         ; Si on a atteint ce patch, on le supprime de la liste, et on va donc continuer vers le prochain patch du chemin
         if patch-here = next-patch [
@@ -561,8 +630,14 @@ to convois-think
         ]
       ]
 
+      let msg get-message
+      if protecteur = nobody [set suiviParDrone? false]
+      if msg != "no_message" and get-content(msg) = "Je te suis !" [
+        ifelse not suiviParDrone? [ convoi-communicate "inform" turtle-set drone read-from-string get-sender(msg) "OK" set suiviParDrone? true set protecteur drone read-from-string get-sender(msg) ]
+        [ if protecteur != drone read-from-string get-sender(msg) [ convoi-communicate "inform" turtle-set drone read-from-string get-sender(msg) "KO" ] ]
+      ]
       ; Critere d'arret: on est a cote de l'objectif
-      check-convoi-finished
+      check-convoi-finished self
 
     ]
 
@@ -585,21 +660,23 @@ end
 ; Le voisin de la voiture à protèger ne peut pas s'en séparer !
 to separate [turtle1 turtle2] ; Ici, turtle1 précède turtle2
   let last-car max [who] of convois
-  if [who] of turtle1 = last-car [ show (word "Erreur : " turtle1 " est à protéger !") stop ]
+  if [who] of turtle1 = last-car or [who] of turtle2 = last-car [ if debug [ show (word "Erreur : " turtle1 " est à protéger !") stop ] ]
   ; Si turtle1 n'a pas de suivant
-  if not any? [out-convoi-link-neighbors] of turtle1 [ show (word "Erreur : " turtle1 " n'a pas de suivant ") stop ]
+  if not any? [out-convoi-link-neighbors] of turtle1 [ if debug [ show (word "Erreur : " turtle1 " n'a pas de suivant ") stop ] ]
   let suivant one-of [out-convoi-link-neighbors] of turtle1
   ; Si le suivant de turtle1 n'est pas turtle2
-  if [who] of suivant != [who] of turtle2 [ show [who] of suivant show [who] of turtle2 show (word turtle1  " et "  turtle2  " ne sont pas reliés !") stop ]
+  if [who] of suivant != [who] of turtle2 [ if debug [ show (word turtle1  " et "  turtle2  " ne sont pas reliés !") stop ] ]
 
   ask turtle1 [
-    ; Suppression du lien
-    ask convoi-link [who] of turtle1 [who] of turtle2 [ die ]
+    if convoi-link [who] of turtle1 [who] of turtle2 != nobody [
+      ; Suppression du lien
+      ask convoi-link [who] of turtle1 [who] of turtle2 [ die ]
 
-    ; turtle1 devient leader
-    set leader? true
-    set genlongpath? true
-    if not to-protect? [ set color orange ]
+      ; turtle1 devient leader
+      set leader? true
+      set genlongpath? true
+      if not to-protect? [ set color orange ]
+    ]
   ]
 end
 
@@ -607,19 +684,22 @@ end
 ; Utile car lors de la séparation (cas d'attaque), le convoi qui a la voiture à protéger doit faire un détour
 to-report convoi-to-protect [turtle1]
   if [to-protect?] of turtle1 [ report true ]
-   ; S'il n'a pas de voiture derrière lui, faux car la voiture à protéger est la dernière
-    if not any? [in-convoi-link-neighbors] of turtle1 [ report false ]
-    ; Récursion
-    let suivant one-of [in-convoi-link-neighbors] of turtle1
-    show suivant
-    report convoi-to-protect suivant
+  ; S'il n'a pas de voiture derrière lui, faux car la voiture à protéger est la dernière
+  if not any? [in-convoi-link-neighbors] of turtle1 [ report false ]
+  ; Récursion
+  let suivant one-of [in-convoi-link-neighbors] of turtle1
+  report convoi-to-protect suivant
 end
 
 
 ; turtle1 demande à turtle2, le leader du convoi visé de se reformer
 to aggregate [turtle1 turtle2]
+  ; Verifier si turtle1 est bien un leader
+  if not [leader?] of turtle1 [ if debug [ show "Pas leader !" stop ] ]
   ;Verifier si turtle2 est bien un leader et qu'il est dans le champ de communication
 
+  if not member? turtle2 [other convois-on patches in-radius-nowrap vision-convoi] of turtle1 [ if debug [ show (word "Je ne vois pas " turtle2) stop ] ]
+  if any? [enemies-on patches in-radius-nowrap vision-convoi] of turtle1 [ if debug [ show (word "Endroit pas sûr !") stop ] ]
   ;
 
 
@@ -628,7 +708,7 @@ to aggregate [turtle1 turtle2]
   if not any? [out-convoi-link-neighbors] of turtle1 and not any? [in-convoi-link-neighbors] of turtle2 [
     ask turtle1 [
       create-convoi-link-to turtle2 ; Création du lien
-    ; turtle1 n'est plus leader et reprend sa couleur initiale
+                                    ; turtle1 n'est plus leader et reprend sa couleur initiale
       set leader? false
       set genlongpath? false
       if not to-protect? [ set color magenta ]
@@ -639,24 +719,25 @@ end
 
 
 to-report detect-obstacle
- if any? other patches in-cone-nowrap 10 60 with [obstacle?] [report true]
-; if any? other patches in-cone-nowrap 10 90 [report true]
-; if any? other patches in-cone-nowrap 3 270 [report true]
- report false
+  if any? other patches in-cone-nowrap 10 60 with [obstacle?] [report true]
+  ; if any? other patches in-cone-nowrap 10 90 [report true]
+  ; if any? other patches in-cone-nowrap 3 270 [report true]
+  report false
 end
 
 to turn-away
-   ;let free-patches neighbors with [not any? patches ]
-   ;if any? free-patches [face one-of free-patches]
-   rt random 10 - 5
+  ;let free-patches neighbors with [not any? patches ]
+  ;if any? free-patches [face one-of free-patches]
+  rt random 10 - 5
 end
 
-to check-convoi-finished
+to check-convoi-finished [turtle1]
   ; Critere d'arret: on est a cote de l'objectif
   ; Note: on veut etre a cote de l'objectif et pas directement dessus car on est une voiture, donc il se peut qu'on tourne indefiniment autour sans arriver directement a arriver dessus a cause de la limite d'angle de rotation.
   if any? [neighbors6-nowrap with [objectif?]] of patch-here [ ; On ne bouge pas si on est arrive au but!
                                                                ; Fini pour le leader
     set finished? true
+    if convoi-to-protect turtle1 [ set mission-completed? true ]
     ; Fini aussi pour toutes les voitures-cortege qui suivent ce leader
     let linked-cars (list in-convoi-link-neighbors)
     while [not empty? linked-cars] [ ; on fait une boucle pour recursivement mettre a finished? = true toutes les voitures liees entre elles dans ce cortege
@@ -717,15 +798,18 @@ to move-convoi [goal slowdown? cortege?]
   fd tmp-speed ; Avance
 end
 
+
+
 to convoi-touched [target]
   let msg "no_message"
   ask target [
     ; Perte d'energie et mort éventuelle
     set energy energy - 10
-    ;show ("Aie")
+    if energy < convoi-energy / 2 [set color color - 2]
+    if debug [show ("Aie")]
     if energy <= 0 [
       set dead? true
-      set nb-cars nb-cars - 1
+      if [to-protect?] of target [set mission-failed? true]
       die
     ]
 
@@ -734,7 +818,7 @@ to convoi-touched [target]
       ; Tentative de communication avec le suivant
       convoi-communicate "inform" suivant "separation"
       ask suivant [
-        show incoming-queue
+        if show_messages [show incoming-queue]
         ; Separation si bien recu
         set msg get-message
         if msg != "no_message" and get-content(msg) = "separation" [
@@ -743,11 +827,11 @@ to convoi-touched [target]
       ]
     ]
     if any? in-convoi-link-neighbors [ ; in pointe vers la voiture précédente
-      let precedent in-convoi-link-neighbors
+      let prec in-convoi-link-neighbors
       ; Tentative de communication avec le précédent
-      convoi-communicate "inform" precedent "separation"
-      ask precedent [
-        show incoming-queue
+      convoi-communicate "inform" prec "separation"
+      ask prec [
+        if show_messages [show incoming-queue]
         ; Separation si bien recu
         set msg get-message
         if msg != "no_message" and get-content(msg) = "separation" [
@@ -758,7 +842,7 @@ to convoi-touched [target]
   ]
 end
 
-; Utilisé dans les cas de communication voiture-voiture d'un même convoi / voiture - leader d'un autre convoi / voiture - leader drone / leader convoi - leader drone
+; Utilisé dans les cas de communication voiture-voiture d'un même convoi / voiture - voiture d'un autre convoi via son leader / leader convoi - leader drone
 to convoi-communicate [perf receiver content]
   ; Verifie si le receiver est à portée
   if any? receiver in-radius-nowrap convoi-communication [
@@ -774,32 +858,6 @@ end
 ;  ENEMIES
 ;-----------
 
-;Case nord par rapport à l'agent
-to-report nord
-  report patch-right-and-ahead 0 1
-end
-;Case nord-est par rapport à l'agent
-to-report nord-est
-  report patch-right-and-ahead 45 1
-end
-;Case est par rapport à l'agent
-to-report est
-  report patch-right-and-ahead 90 1
-end
-;Case nord-ouest par rapport à l'agent
-to-report nord-ouest
-  report patch-right-and-ahead -45 1
-end
-;Case ouest par rapport à l'agent
-to-report ouest
-  report patch-right-and-ahead -90 1
-end
-
-to-report sud
-  report patch-right-and-ahead 180 1
-end
-
-
 to move-enemy
   ask enemies [
     if not approach? or mytarget = nobody [
@@ -808,8 +866,9 @@ to move-enemy
         let pos one-of neighbors4 with
         [ abs (pxcor - [pxcor] of myself) <= 1
           and abs (pycor - [pycor] of myself) <= 1
-          and not obstacle?
-          and not any? other turtles-here
+        and not obstacle?
+        and not base?
+        and not any? other convois-here
         ]
         if pos != nobody [
           face pos ; Je me tourne vers une case voisine envisageable
@@ -817,108 +876,104 @@ to move-enemy
 
       ]
 
-      ;let under patch-ahead 1
-      ;set under one-of patches with [pxcor = [pxcor] of under and pycor = [pycor] of under and pzcor = mapAlt] ; La case est au niveau mapAlt ! Test sur la case devant l'agent, au niveau d'en dessous
 
       if (not [obstacle?] of patch-ahead 1 ; Ne roule pas dans l'eau/Sur la montagne
         and not any? other turtles-on patch-ahead 1 ; Ne va pas sur la même case qu'un autre agent
-        ; Pas d'effets de bord
+                                                    ; Pas d'effets de bord
         and abs ([pxcor] of patch-ahead 1 - [pxcor] of self) <= 1
         and abs ([pycor] of patch-ahead 1 - [pycor] of self) <= 1
-        )[fd speed] ; Avance
+        and not [base?] of patch-ahead 1
+        and not [hangar?] of patch-ahead 1)[fd speed] ; Avance
     ] observe-enemy  ; regarde autour de lui dans un rayon de rayon-vision
   ]
 
   foreach sort-on [who] turtle-set enemies with [approach?]
   [ approach ?]
 
-
-
 end
 
 to observe-enemy ; Agit en fonction de l'agent présent dans son champ de vision
+  gest-rockets
+  if any? convois in-cone-nowrap rayon-vision 180 with [pzcor = solAlt and not hangar? and not base?] [
 
-    if any? convois in-cone-nowrap rayon-vision 180 [
-
-      ;show (word "Je vois " count convois in-radius-nowrap rayon-vision " voiture(s) du convoi")
-      let target min-one-of convois in-cone-nowrap rayon-vision 180 [distance-nowrap myself] ; cible la plus proche
-      let l [patches in-radius-nowrap portee-enemy] of target
-      set l l with [not obstacle?]
-      set mytarget min-one-of l [distance-nowrap myself]
-      ; Verifie si sa cible est atteignable
-      ifelse (distance-nowrap target <= portee-enemy)
+    ;show (word "Je vois " count convois in-radius-nowrap rayon-vision " voiture(s) du convoi")
+    let target min-one-of convois in-cone-nowrap rayon-vision 180 with [pzcor = solAlt and not hangar? and not base?] [distance-nowrap myself] ; cible la plus proche
+    let l [patches in-radius-nowrap portee-enemy with [pzcor = solAlt]] of target
+    set l l with [not obstacle?]
+    set mytarget min-one-of l [distance-nowrap myself]
+    ; Verifie si sa cible est atteignable
+    ifelse (distance-nowrap target <= portee-enemy)
       [set heading towards-nowrap target attack-enemy(target)]
       [ set approach? true ]
-    ]
+  ]
 
   if any? drones in-radius-nowrap rayon-vision [
 
     let target min-one-of drones in-radius-nowrap rayon-vision [distance-nowrap myself] ; cible la plus proche
-      ask target [set color yellow]
-      ; Verifie si sa cible est atteignable
-      if (distance-nowrap target <= portee-enemy)  [attack-enemy(target)]
+    ;ask target [set color yellow]
+    ; Verifie si sa cible est atteignable
+    if (distance-nowrap target <= portee-enemy)  [attack-enemy(target)]
 
-    ]
+  ]
   ;Après - if any? enemies in-radius-nowrap rayon-vision [ communiquer ]
 end
 
 to attack-enemy [target] ; L'ennemi tire sur la cible
-  let touch? false
-  if (ticks mod 10 = 0) [
+  if ticks > cpt-tick-enemy + 10 [
     hatch-rockets 1 [ ; Création de la balle
+      no-display
       set size 0.3
-      setxyz xcor ycor zcor ; Part de l'ennemi
+      setxyz xcor ycor (zcor - 0.40) ; Part de l'ennemi
       set color red
-      ; Probabilité de rater son tir
+      display
+      face-nowrap target
       let angle towards-nowrap target ; angle pour se tourner vers la cible
-      if (random-float 1.0 >= awkwardness) [ set angle angle + (random 41 ) - 20 ]
+      ; Probabilité de rater son tir
+      if random-float 1.0 <= awkwardness [ set angle angle + 20 ]
       set heading angle
       set origin myself
+      set cible target
+      ; L'ennemi (origin) ne peut tirer que tous les cpt-tick-enemy ticks
+      ask origin [set cpt-tick-enemy ticks]
     ]
-      ifelse [breed] of target = convois [
-        ask rockets [
-          ; Continue d'avancer tant que la cible n'est pas atteinte et dans la portée de l'agent
-          while [ any? (turtle-set origin) in-radius-nowrap portee-enemy and not any? convois-on patch-here][ fd 0.5 ]
-          ifelse any? convois-on patch-here [
-            ask rockets-on convois [ set touch? true set shape "fire" set size 1 wait 0.5 die ] ; Si la balle atteint la cible
-          ]
-          [ set shape "fire" set size 1 wait 0.3 die ] ; Disparait sinon
-        ]
-        if (touch?) [
-          convoi-touched target
-        ]
-      ] [ ask rockets [
-        face-nowrap target
-        ; Continue d'avancer tant que la cible n'est pas atteinte et dans la portée de l'agent
-        while [ any? (turtle-set origin) in-radius-nowrap portee-enemy and not any? drones-on patch-here][ fd 0.5 ]
-        ifelse any? drones-on patch-here [
-          ask rockets-on drones [ set touch? true set shape "fire" set size 1.2 wait 0.5 die ] ; Si la balle atteint la cible
-        ]
-        [ set shape "fire" set size 1 wait 0.3 die ] ; Disparait sinon
-      ]
-      if (touch?) [
-         drone-touched target
-      ]
-      ]
   ]
+end
 
+to gest-rockets
+  ask rockets [
+    let touch? false
+    ; Il se peut que l'ennemi ait tiré plusieurs balles mais que la cible meure entre temps. Les balles explosent dans le vide
+    if cible = nobody [ set shape "fire" set size 1 wait 0.2 die]
+    ; Continue d'avancer tant que la cible n'est pas atteinte et dans la portée de l'agent
+    fd 0.2
+    ;while [ any? (turtle-set origin) in-radius-nowrap portee-enemy and not any? drones-on patch-here][ fd 0.5 ]
+    if distance-nowrap origin > portee-enemy [ set shape "fire" set size 1 wait 0.2 die ] ; Disparait si hors de portée ou touche un obstacle
+    if [hangar?] of patch-here or [base?] of patch-here [ set shape "fire" set size 1 wait 0.2 die ]
+   ; on teste dans le voisinage pour un drone car il est plus dur à atteindre (déplacement sur 3 axes)
+    if member? patch-here [patches in-radius-nowrap 1] of cible [
+      ask rockets-on [patches in-radius-nowrap 1] of cible [
+        set touch? true
+        set shape "fire"
+        set size 1.2
+        wait 0.2
+        ifelse [breed] of cible = convois [ convoi-touched cible ] [ drone-touched cible ]
+        die ] ; Si la balle atteint la cible
+    ]
+  ]
 end
 
 ; Cas où la cible est hors de portée d'un ennemi - il se rapproche
 to approach [ennemi]
-  ;let path nobody
-  ;if [mypath] of ennemi = [] [
   let path plan-astar ([patch-here] of ennemi) ([mytarget] of ennemi) false;]
-  ;calcul du plus court chemin vers la cible ?
+  ; calcul du plus court chemin vers la cible ?
   ; Si pas de chemin, l'ennemi abandonne
   if path = [] [ask ennemi [set approach? false set mypath [] set mytarget nobody] stop]
   ; S'il y a un chemin et que l'ennemi n'en a pas, il le suit
   ask ennemi [
     if mypath = [] [set mypath path]
-   ; foreach mypath [ask ? [set pcolor pink]]
+    ; foreach mypath [ask ? [set pcolor pink]]
     let next first mypath
     if next != patch-here [
-
       set heading towards-nowrap next
       set pitch 0
       if not any? other turtles-on patch-ahead 1 [fd speed]
@@ -932,33 +987,161 @@ end
 ;  DRONES
 ;-----------
 
-to move-drone ;Aleatoire pour l'instant
- ask drones [
-   if random-float 1 <= 0.4 [ ;Probabilité de changer de direction
-      ; Choix de la case suivante (case adjacente/inoccupée)
-      let pos one-of neighbors4 with
-      [ abs (pxcor - [pxcor] of myself) <= 1
-        and abs (pycor - [pycor] of myself) <= 1
-        and abs (pzcor - [pzcor] of myself) <= 1
-        and not obstacle? ;Evite le lac
-        and not any? other turtles-here ;Ne va pas sur la même case qu'un autre drone
-      ]
 
-      if pos != nobody [ ; Je me tourne vers une case voisine
-        face pos
-      ]
-      if (not [obstacle?] of patch-ahead 1)[fd speed] ; J'avance
-      ;observe-drone ; regarde autour de lui dans un rayon de rayon-vision
-    ]
- ]
+to drone-communicate [perf receiver content]
+  ; Verifie si le receiver est à portée
+  if any? receiver in-radius-nowrap drone-communication [
+    let m create-message perf
+    set m add-receiver first [who] of receiver m
+    set m add-content content m
+    send m
+  ]
 end
 
-to observe-drone ; Agit en fonction de l'agent présent dans son champ de vision
-  if any? enemies in-radius-nowrap rayon-vision [
-    let target min-one-of enemies in-radius-nowrap rayon-vision [distance-nowrap myself] ; cible le plus proche
-    set heading towards target ; Se tourne vers la cible
-    attack-drone(target)
+to drone-think
+  ; décollage et atténuation
+  let fin-decollage? false
+  ask drones [
+    ifelse get-intentions != [] [ execute-intentions ] [ set fin-decollage? true ]
   ]
+  if not fin-decollage? [ stop ]
+
+  observe-drone
+
+end
+
+
+to move-drone-alea [drone]
+  ask drone [ fd speed ]
+end
+
+
+;Le leader drone suit une voiture leader
+to follow-convoi [car]
+  ;Calcul du chemin pour survoler le leader convoi
+  foreach sort-on [who] turtle-set drones with [leader? and suivreConvoi?] [
+    let patchConvoi [patch-here] of car
+    set patchConvoi patch [pxcor] of patchConvoi [pycor] of patchConvoi [pzcor] of ?
+    let path plan-astar ([patch-here] of ?) (patchConvoi) false
+    if path = [] [ask ? [ set dronepath [] ] stop ]
+   ; foreach path [ ask ? [ set pcolor pink] ]
+    ;Le leader drone suit ce chemin
+    ask ? [
+      if dronepath = [] [set dronepath path]
+      let next first dronepath
+      ifelse next != patch-here [
+        set heading towards-nowrap next
+        if not any? other drones-on patch-ahead 1 [fd speed]
+      ][ set dronepath remove-item 0 dronepath ]
+    ]
+  ]
+end
+
+; Les drones non-leader suivent le drone devant eux
+to move-drone [goal]
+  let headingFlag heading
+  set headingFlag (towards-nowrap goal)
+  let dirCorrection subtract-headings headingFlag heading
+  ; Arrondissement de l'angle (on ne veut pas faire de micro tournant)
+  set dirCorrection precision dirCorrection 2
+  ; Limite de l'angle, pour que ce soit plus realiste (la voiture ne peut pas faire un demi-tour sur place!)
+  ifelse dirCorrection > maxdir [ ; limite a droite
+    set dirCorrection maxdir
+  ]
+  [
+    if dirCorrection < maxdir * -1 [ ; limite a gauche
+      set dirCorrection maxdir * -1
+    ]
+  ]
+  ; On tourne
+  rt dirCorrection
+  set pitch [pitch] of goal
+  let tmp-speed speed
+  if any? out-drone-link-neighbors [
+    if distance-nowrap one-of out-drone-link-neighbors < 2.1 [
+      set tmp-speed tmp-speed / 20
+    ]
+    if distance-nowrap one-of out-drone-link-neighbors < 1.9 [
+      set tmp-speed 0
+    ]
+  ]
+    fd tmp-speed ; Avance
+end
+
+
+; Pour vérifier la vision des turtles
+to test
+  let dist 1
+  let angle 0
+  let fin false
+  while [angle <= 180 ] [
+    while [dist < 8 and not fin] [
+      ask patches in-cone-nowrap dist angle with [pzcor = solAlt] [
+        ifelse not [hangar?] of self and not [base?] of self [ set pcolor red ][set fin true]
+      ]
+      set dist dist + 1 ]
+    set fin false
+    set dist 1
+    set angle angle + 10 ]
+end
+
+
+to observe-drone
+  let car nobody
+  let msg "no_message"
+  foreach sort-on [who] turtle-set drones with [leader?] [
+    let vision no-patches
+    ask ? [
+      ; Plus un drone est haut, plus sa zone de vision au sol augmente
+      let alt [zcor] of self
+      set vision patch [xcor] of self [ycor] of self solAlt
+      ask vision [ set vision patches in-radius-nowrap ([rayon-vision] of ? + alt) with [pzcor = solAlt] ]
+      ;ask vision [set pcolor pink]
+
+      ; CAS CONVOIS
+      if any? convois-on vision [
+        ; On suit le leader le plus proche dans ce champ
+        set car turtle-set convois-on vision
+        set car car with [ leader? and not finished? ]
+        set car min-one-of car [distance self]
+
+        ; S'il y a bien un leader "libre", on le suit
+        ifelse car != nobody [
+          ; Si je ne protège personne j'informe le leader que je le suis
+          if aProteger = nobody [
+            drone-communicate "inform" turtle-set car "Je te suis !"
+            ; Si je reçois OK, je le suis
+            show incoming-queue
+            set msg get-message
+            if msg != "no_message" and get-content(msg) = "OK" [ set suivreConvoi? true set aProteger car ]
+          ]
+        ] [ set suivreConvoi? false set aProteger nobody ]
+      ]
+
+      ; CAS ENNEMIS (Le drone tente de tuer l'ennemi le plus proche)
+      ; Si le drone suit un convoi leader, l'avertit des emplacements des ennemis
+      if any? enemies-on vision [
+        if suivreConvoi? [ show (word "Je dois avertir " aProteger) ]
+      ]
+
+
+
+    ]
+
+    ; Je suis le leader à proteger s'il y en a un. Sinon, mouvement aléatoire
+    ifelse [suivreConvoi?] of ? [follow-convoi car ] [ ask ? [ set dronepath [] set aProteger nobody  move-drone-alea ? ] ]
+  ]
+
+  ; Les autres drones suivent leur suivant
+  ask drones with [not leader?] [
+    ifelse any? my-out-drone-links [ move-drone (one-of out-drone-link-neighbors) ]
+      [
+        set leader? true
+        set color orange
+      ]
+  ]
+
+
 end
 
 to attack-drone [target] ; Le drone tire sur la cible
@@ -969,16 +1152,16 @@ to attack-drone [target] ; Le drone tire sur la cible
       setxyz xcor ycor zcor ; Part du drone
       set color red
 
-      set heading towards target ; Se dirige vers l'ennemie
+      set heading towards target ; Se dirige vers l'ennemi
       set origin myself
     ]
     ask rockets [
       ; Continue d'avancer tant que la cible n'est pas atteinte et dans la portée de l'agent
-      while [ any? (turtle-set origin) in-radius-nowrap portee-enemy and not any? enemies-on patch-here][ fd 0.5 ]
-     ifelse any? enemies-on patch-here [
-       ask rockets-on enemies [ set touch? true set shape "fire" set size 1 wait 1 die ] ; Si la balle atteint la cible
-     ]
-     [ die ] ; Disparait sinon
+      while [ any? (turtle-set origin) in-radius-nowrap portee-enemy and not any? enemies-on patch-here][ fd 0.2 ]
+      ifelse any? enemies-on patch-here [
+        ask rockets-on enemies [ set touch? true set shape "fire" set size 1 wait 0.2 die ] ; Si la balle atteint la cible
+      ]
+      [ die ] ; Disparait sinon
     ]
     if (touch?) [ask target [ set dead? true set nb-enemies nb-enemies - 1 die ] ]
   ]
@@ -986,10 +1169,9 @@ end
 
 to drone-touched [target]
   ask target [
-    ; Perte d'energie et mort éventuelle
-      set dead? true
-      die
-    ]
+    set dead? true
+    die
+  ]
 end
 
 
@@ -997,20 +1179,23 @@ end
 to go
   ; Verifie si la portée des ennemis <= leur vision
   if (vision-enemy < portee-enemy) [
-    user-message (word "Les ennemis doivent avoir une vision supérieure à leur portée !")
+    user-message (word "Les agents doivent avoir une vision supérieure à leur portée !")
     stop
   ]
+
   convois-think
   move-enemy
-  move-drone
+  drone-think
+  ;if check-win = 0 [ user-message "La voiture à protéger a été abattue !" stop ]
+  ;if check-win = 1 [ user-message "Gagné !" stop ]
   tick
 end
 @#$#@#$#@
 GRAPHICS-WINDOW
 0
 0
-245
-241
+270
+291
 -1
 -1
 10.0
@@ -1024,9 +1209,9 @@ GRAPHICS-WINDOW
 1
 1
 0
-20
+25
 0
-20
+25
 0
 10
 1
@@ -1049,7 +1234,7 @@ debug
 SWITCH
 13
 235
-178
+141
 268
 debug-verbose
 debug-verbose
@@ -1073,7 +1258,7 @@ INPUTBOX
 70
 115
 nb-cars
-2
+5
 1
 0
 Number
@@ -1101,7 +1286,7 @@ INPUTBOX
 159
 115
 nb-mountains
-3
+0
 1
 0
 Number
@@ -1112,7 +1297,7 @@ INPUTBOX
 214
 115
 nb-lakes
-1
+0
 1
 0
 Number
@@ -1130,9 +1315,9 @@ Number
 
 INPUTBOX
 673
-340
+383
 834
-400
+443
 astar-faster
 20
 1
@@ -1141,9 +1326,9 @@ Number
 
 INPUTBOX
 673
-414
+457
 834
-474
+517
 astar-max-depth
 5000
 1
@@ -1152,9 +1337,9 @@ Number
 
 SWITCH
 481
-338
+381
 645
-371
+414
 astar-longpath
 astar-longpath
 1
@@ -1163,31 +1348,31 @@ astar-longpath
 
 SWITCH
 481
-382
-644
-415
-astar-randpath
-astar-randpath
-0
-1
--1000
-
-SWITCH
-482
-467
-644
-500
-astar-visu-more
-astar-visu-more
-1
-1
--1000
-
-SWITCH
-482
 425
-645
+644
 458
+astar-randpath
+astar-randpath
+1
+1
+-1000
+
+SWITCH
+482
+510
+644
+543
+astar-visu-more
+astar-visu-more
+1
+1
+-1000
+
+SWITCH
+482
+468
+645
+501
 astar-visu
 astar-visu
 0
@@ -1231,9 +1416,9 @@ Simulation
 
 TEXTBOX
 471
-309
+352
 607
-327
+370
 A*
 12
 0.0
@@ -1262,7 +1447,7 @@ INPUTBOX
 352
 115
 nb-enemies
-2
+0
 1
 0
 Number
@@ -1276,37 +1461,37 @@ vision-enemy
 vision-enemy
 1
 10
-10
+6
 1
 1
 NIL
 HORIZONTAL
 
 TEXTBOX
-476
-25
-543
-43
+472
+23
+539
+41
 Ennemis
 12
 0.0
 1
 
 TEXTBOX
-690
-23
-737
-41
+682
+22
+729
+40
 Convoi
 12
 0.0
 1
 
 SLIDER
-689
-56
-861
-89
+691
+100
+863
+133
 convoi-energy
 convoi-energy
 10
@@ -1323,16 +1508,16 @@ INPUTBOX
 430
 115
 nb-drones
-0
+5
 1
 0
 Number
 
 TEXTBOX
-480
-215
-532
-233
+472
+214
+524
+232
 Drones
 12
 0.0
@@ -1345,19 +1530,19 @@ SLIDER
 278
 vision-drone
 vision-drone
-1
+2
 10
-10
+5
 1
 1
 NIL
 HORIZONTAL
 
 SWITCH
-205
-183
-376
-216
+201
+188
+333
+221
 show-intentions
 show-intentions
 1
@@ -1365,10 +1550,10 @@ show-intentions
 -1000
 
 SWITCH
-206
-232
-380
-265
+201
+234
+335
+267
 show_messages
 show_messages
 1
@@ -1377,14 +1562,14 @@ show_messages
 
 SLIDER
 690
-101
+55
 862
-134
+88
 vision-convoi
 vision-convoi
 1
 10
-5
+10
 1
 1
 NIL
@@ -1398,8 +1583,8 @@ SLIDER
 convoi-communication
 convoi-communication
 1
-10
-2
+20
+20
 1
 1
 NIL
@@ -1412,9 +1597,9 @@ SLIDER
 132
 portee-enemy
 portee-enemy
-2
+1
 10
-3
+6
 1
 1
 NIL
@@ -1429,8 +1614,33 @@ awkwardness
 awkwardness
 0
 1
-0.5
+1
 0.1
+1
+NIL
+HORIZONTAL
+
+TEXTBOX
+194
+154
+344
+172
+Affichage
+12
+0.0
+1
+
+SLIDER
+478
+295
+650
+328
+drone-communication
+drone-communication
+1
+20
+20
+1
 1
 NIL
 HORIZONTAL
@@ -1670,6 +1880,20 @@ Polygon -7500403 true true 165 180 165 210 225 180 255 120 210 135
 Polygon -7500403 true true 135 105 90 60 45 45 75 105 135 135
 Polygon -7500403 true true 165 105 165 135 225 105 255 45 210 60
 Polygon -7500403 true true 135 90 120 45 150 15 180 45 165 90
+
+rocket
+true
+0
+Polygon -7500403 true true 120 165 75 285 135 255 165 255 225 285 180 165
+Polygon -1 true false 135 285 105 135 105 105 120 45 135 15 150 0 165 15 180 45 195 105 195 135 165 285
+Rectangle -7500403 true true 147 176 153 288
+Polygon -7500403 true true 120 45 180 45 165 15 150 0 135 15
+Line -7500403 true 105 105 135 120
+Line -7500403 true 135 120 165 120
+Line -7500403 true 165 120 195 105
+Line -7500403 true 105 135 135 150
+Line -7500403 true 135 150 165 150
+Line -7500403 true 165 150 195 135
 
 sheep
 false
