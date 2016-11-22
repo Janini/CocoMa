@@ -1,0 +1,383 @@
+breed [convois convoi]
+directed-link-breed [convoi-links convoi-link]
+
+convois-own[
+  incoming-queue
+  beliefs
+  intentions
+  attacked? ; Vrai si le convoi est attaqué
+  energy
+  finished? ; Is the goal reached ?
+  leader?   ; car leading the convoi convoi
+  to-protect? ; Should this car be protected at all cost ?
+  genlongpath? ; Should the leader compute a new path (but not shortest) ?
+  dead?
+  speed maxdir ; maximal speed of a car, and max angle
+  last-send-time ; communication historical time-stamp
+  suiviParDrone?
+  protecteur
+]
+
+
+to setup-convois
+  if nb-cars > 0 [
+    ; get the size of the base to deploy the car accordingly
+    let base-min-pxcor min [pxcor] of (patches with [hangar? and pzcor = solAlt])
+    let base-max-pxcor max [pxcor] of (patches with [hangar? and pzcor = solAlt])
+    let base-min-pycor min [pycor] of (patches with [hangar? and pzcor = solAlt])
+    let base-max-pycor max [pycor] of (patches with [hangar? and pzcor = solAlt])
+
+    ; creation des voitures du convoi et cortege
+    create-convois nb-cars
+    ask convois
+    [
+      ; Init apparence NetLogo
+      set shape "car"
+      set color magenta
+
+      ; Init des structures BDI
+      set incoming-queue [] ; Do not change
+
+                            ; Init vars convois
+      set speed 0.05 * simu-speed
+      set maxdir 10 * simu-speed
+      set heading 0
+      set roll 0
+      set pitch 0
+      set finished? false
+      set leader? false
+      set to-protect? false
+      set genlongpath? false
+      set dead? false
+      set energy convoi-energy
+      set suiviParDrone? false
+      set protecteur nobody
+
+      ; Visu
+      set label who ; display the car names
+    ]
+
+    ; get the id of the first one
+    let first-car min [who] of convois
+    let last-car max [who] of convois
+
+    ; configure the leader
+    ask convoi first-car [
+      set leader? true
+      set color orange
+      move-to patch base-max-pxcor base-max-pycor 1
+    ]
+
+    ; configure the last car as the critical one
+    ask convoi last-car [
+      set to-protect? true
+      set color yellow
+    ]
+
+    ; deploying the other car
+    if nb-cars > 1 [
+      ; ask non leader cars
+      ask turtle-set sort-on [who] convois with [who > first-car]
+      [
+        ; we create a link between them
+        create-convoi-link-to turtle (who - 1)
+  ;if who >= 4 and who mod 2 = 0 [ create-convoi-link-with turtle (who - 3) ]
+
+  ; deploying
+  ifelse (who - 1) mod 2 = 0 [ set xcor base-min-pxcor ] [ set xcor base-max-pxcor ] ; a gauche ou a droite selon le nombre (pair ou impair respectivement)
+  set ycor base-max-pycor - (floor (who / 2) / (nb-cars / 2) * (base-max-pycor - base-min-pycor)) ; d'une rangee de plus en plus basse toutes les deux voitures
+  set zcor solAlt
+      ]
+
+    ]
+  ]
+end
+ 
+
+; Procedure principale de gestion des convois
+to convois-think
+
+  if count convois > 0 [
+
+    let first-car min [who] of convois
+
+    ; Calcul du plan AStar pour chaque leader si necessaire
+    foreach sort-on [who] turtle-set convois with [leader? and not finished? and not dead?] [
+        
+      let id ([who] of ?) - first-car
+      ; Recalcule le chemin si nécessaire (par exemple au début de la simulation ou quand le convoi se sépare)
+      ; Note: on est oblige de le faire en dehors du ask sinon on ne peut pas acceder a tous les patchs
+      if empty? as-path or length as-path < (id + 1) or empty? (item id as-path) [ ; s'il n'y a pas encore de chemin du tout, ou pas de chemin pour cette voiture, on cree un plan AStar
+                                                                                   ; Cree le plan AStar (attention a ca que le patch start soit au niveau ou il y a les obstacles, ici pzcor = mapAlt pour les obstacles)
+        let start-patch min-one-of (patches with [pzcor = solAlt and not obstacle?]) [distance ?] ; on s'assure de choisir comme patch de depart un patch libre sans obstacle, sinon quand on split un convoi il se peut qu'il soit sur un obstacle et qu'il ne puisse jamais generer de chemin
+        let new-path plan-astar ([patch-at 0 0 (pzcor * -1)] of start-patch) (one-of patches with [objectif?]) ([genlongpath?] of ?)
+        ; S'il n'y a pas de plan et qu'on a essayé de trouver un long chemin, on attend la prochaine iteration et on reessaie mais avec un plan court
+        if empty? new-path and [genlongpath?] of ? [ ask ? [ set genlongpath? false ] ]
+        ; S'il n'y a pas deja une entree pour cette voiture on la cree
+        ifelse length as-path < (id + 1) [
+          set as-path lput new-path as-path
+        ]
+        ; Sinon on remplace l'entree pour cette voiture par le nouveau plan
+        [
+          set as-path replace-item id as-path new-path
+        ]
+      ]
+      ; Si un leader voit un ennemi, changement de trajectoire
+      ;let vision [patches in-radius-nowrap vision-convoi with [ pzcor = solAlt ]] of ?
+     ; if any? enemies-on vision  [
+        ;Recuperer l'ennemi le plus proche
+       ; let min-enemy [patch-here] of min-one-of (enemies-on vision) [distance ?]
+       ; show min-enemy
+       ; while [member? min-enemy plan-astar [patch-here] of ? one-of patches with [objectif?] true]
+       ; [ let path plan-astar [patch-here] of ? one-of patches with [objectif?] true
+       ;   ask ? [ set as-path replace-item id as-path path ]
+       ; ]
+     ; ]
+      ; Si je reçois un message de la part d'une voiture, changement de trajectoire
+      ; Si je reçois un message de la part des drones, je change de trajectoire
+    ]
+
+    ; Deplacement des leaders sur le chemin AStar
+    ask convois with [leader? and not finished? and not dead?] [ ; Tant qu'on n'a pas atteint le but
+                                                                 ;move-convoi-naive ; deplacement naif sans AStar
+  show incoming-queue
+                                                                 ; Recupere le plan AStar
+      let my-as-path item (who - first-car) as-path
+      if not empty? my-as-path [
+        ; Deplacement par waypoints: on se deplace jusqu'au prochain patch du chemin jusqu'à l'atteindre
+        let next-patch first my-as-path
+        let zz pzcor
+        set next-patch [patch-at 0 0 (zz - pzcor)] of next-patch ; mise a niveau de pzcor au cas ou le chemin a ete calculé sur un autre plan
+                                                                 ; Deplacement vers le prochain waypoint
+        if next-patch != patch-here [move-convoi next-patch false false]
+        ; Si on a atteint ce patch, on le supprime de la liste, et on va donc continuer vers le prochain patch du chemin
+        if patch-here = next-patch [
+          set my-as-path remove-item 0 my-as-path
+          set as-path replace-item (who - first-car) as-path my-as-path
+          if debug [ show (word "Waypoint atteint: " patch-here ", prochain: " next-patch ) ]
+        ]
+      ]
+      if protecteur = nobody [set suiviParDrone? false]
+      reception-messages
+      ; Critere d'arret: on est a cote de l'objectif
+      check-convoi-finished self
+
+    ]
+
+    ; Deplacement des voitures-cortege: elles ne font que suivre la voiture devant eux (avec laquelle elles sont liées)
+    ask convois with [not leader? and not finished? and not dead?] [
+      ifelse any? my-out-convoi-links [
+        move-convoi ([patch-here] of one-of out-convoi-link-neighbors) true true
+      ]
+      ; S'il n'y a pas de lien devant, c'est probablement que la voiture est morte, donc on devient leader
+      [
+        set leader? true
+        set genlongpath? true
+        if not to-protect? [ set color orange ]
+      ]
+    ]
+  ]
+
+end
+
+
+to reception-messages
+  let msg get-message
+  ; Communication pour être protégé par un drone
+  if msg != "no_message" and get-content(msg) = "Je te suis !" [
+    ifelse not suiviParDrone? [ convoi-communicate "inform" turtle-set drone read-from-string get-sender(msg) "OK" set suiviParDrone? true set protecteur drone read-from-string get-sender(msg) ]
+      [ if protecteur != drone read-from-string get-sender(msg) [ convoi-communicate "inform" turtle-set drone read-from-string get-sender(msg) "KO" ] ]
+  ]
+  
+  ; Reception d'une postion d'un ennemi par un drone
+  if position "Ennemi" msg != false [
+    let enemy-pos substring msg 7 length msg
+    ; Après - essayer de générer un chemin sans cette position ?
+    ]
+end
+
+to check-convoi-finished [turtle1]
+  ; Critere d'arret: on est a cote de l'objectif
+  ; Note: on veut etre a cote de l'objectif et pas directement dessus car on est une voiture, donc il se peut qu'on tourne indefiniment autour sans arriver directement a arriver dessus a cause de la limite d'angle de rotation.
+  if any? [neighbors6-nowrap with [objectif?]] of patch-here [ ; On ne bouge pas si on est arrive au but!
+    ; Fini pour le leader
+    set finished? true
+    if convoi-to-protect turtle1 [ set mission-completed? true ]
+    ; Fini aussi pour toutes les voitures-cortege qui suivent ce leader
+    let linked-cars (list in-convoi-link-neighbors)
+    while [not empty? linked-cars] [ ; on fait une boucle pour recursivement mettre a finished? = true toutes les voitures liees entre elles dans ce cortege
+      let next-linked-cars []
+      foreach linked-cars [
+        ask ? [
+          set finished? true
+          if any? in-convoi-link-neighbors [ ; on recupere les voitures-cortege liees a la voiture-cortege en cours
+            set next-linked-cars lput in-convoi-link-neighbors next-linked-cars
+          ]
+        ]
+      ]
+      set linked-cars next-linked-cars
+    ]
+  ]
+end
+
+
+
+; Supprime le lien entre deux voitures du convoi
+; Le voisin de la voiture à protèger ne peut pas s'en séparer !
+to separate [turtle1 turtle2] ; Ici, turtle1 précède turtle2
+  let last-car max [who] of convois
+  if [who] of turtle1 = last-car or [who] of turtle2 = last-car [ if debug [ show (word "Erreur : " turtle1 " est à protéger !") stop ] ]
+  ; Si turtle1 n'a pas de suivant
+  if not any? [out-convoi-link-neighbors] of turtle1 [ if debug [ show (word "Erreur : " turtle1 " n'a pas de suivant ") stop ] ]
+  let suivant one-of [out-convoi-link-neighbors] of turtle1
+  ; Si le suivant de turtle1 n'est pas turtle2
+  if [who] of suivant != [who] of turtle2 [ if debug [ show (word turtle1  " et "  turtle2  " ne sont pas reliés !") stop ] ]
+
+  ask turtle1 [
+    if convoi-link [who] of turtle1 [who] of turtle2 != nobody [
+      ; Suppression du lien
+      ask convoi-link [who] of turtle1 [who] of turtle2 [ die ]
+
+      ; turtle1 devient leader
+      set leader? true
+      set genlongpath? true
+      if not to-protect? [ set color orange ]
+    ]
+  ]
+end
+
+; Renvoie vrai si la voiture à protéger appartient au même convoi que turtle1
+; Utile car lors de la séparation (cas d'attaque), le convoi qui a la voiture à protéger doit faire un détour
+to-report convoi-to-protect [turtle1]
+  if [to-protect?] of turtle1 [ report true ]
+  ; S'il n'a pas de voiture derrière lui, faux car la voiture à protéger est la dernière
+  if not any? [in-convoi-link-neighbors] of turtle1 [ report false ]
+  ; Récursion
+  let suivant one-of [in-convoi-link-neighbors] of turtle1
+  report convoi-to-protect suivant
+end
+
+
+; turtle1 demande à turtle2, le leader du convoi visé de se reformer
+to aggregate [turtle1 turtle2]
+  ; Verifier si turtle1 est bien un leader
+  if not [leader?] of turtle1 [ if debug [ show "Pas leader !" stop ] ]
+  ;Verifier si turtle2 est bien un leader et qu'il est dans le champ de communication
+
+  if not member? turtle2 [other convois-on patches in-radius-nowrap vision-convoi] of turtle1 [ if debug [ show (word "Je ne vois pas " turtle2) stop ] ]
+  if any? [enemies-on patches in-radius-nowrap vision-convoi] of turtle1 [ if debug [ show (word "Endroit pas sûr !") stop ] ]
+  ;
+
+
+
+  ; Verifier si turtle1 n'a pas de suivant - si turtle2 n'a pas de précédent
+  if not any? [out-convoi-link-neighbors] of turtle1 and not any? [in-convoi-link-neighbors] of turtle2 [
+    ask turtle1 [
+      create-convoi-link-to turtle2 ; Création du lien
+                                    ; turtle1 n'est plus leader et reprend sa couleur initiale
+      set leader? false
+      set genlongpath? false
+      if not to-protect? [ set color magenta ]
+    ]
+  ]
+
+end
+
+
+; Avancer une voiture
+; Permet de faire avancer les voitures d'un convoi (cortege et leader)
+; Maintien egalement une petite distance afin de ne pas "rentrer" dans la voiture de devant
+to move-convoi [goal slowdown? cortege?]
+  ;show (word "ici:" patch-here " goal:" goal)
+
+  ; Calcul de l'angle avec la cible
+  let headingFlag heading
+  ifelse cortege?
+  [ set headingFlag (towards goal) ] ; Si c'est un cortege, on veut qu'il suive toujours le leader par le chemin le plus court (surtout en play-mode ou le joueur n'est pas limite par le nowrap)
+  [ set headingFlag (towards-nowrap goal) ]
+  let dirCorrection subtract-headings headingFlag heading
+  ; Arrondissement de l'angle (on ne veut pas faire de micro tournant)
+  set dirCorrection precision dirCorrection 2
+  ; Limite de l'angle, pour que ce soit plus realiste (la voiture ne peut pas faire un demi-tour sur place!)
+  ifelse dirCorrection > maxdir [ ; limite a droite
+    set dirCorrection maxdir
+  ]
+  [
+    if dirCorrection < maxdir * -1 [ ; limite a gauche
+      set dirCorrection maxdir * -1
+    ]
+  ]
+
+  ; On tourne
+  rt dirCorrection
+
+  ; Limite de vitesse pour les voitures-cortege (pour pas qu'elles ne rentrent dans la voiture leader)
+  let tmp-speed speed
+  if slowdown? [
+    if distance-nowrap goal < 1.1 [
+      set tmp-speed tmp-speed / 20
+    ]
+    if distance-nowrap goal < 0.9 [
+      set tmp-speed 0
+    ]
+  ]
+
+  ; Deplacement!
+  set pitch 0 ; make sure there's no pitch ever, else the car will disappear in the ground
+  fd tmp-speed ; Avance
+end
+
+
+
+to convoi-touched [target]
+  let msg "no_message"
+  ask target [
+    ; Perte d'energie et mort éventuelle
+    set energy energy - 10
+    if energy < convoi-energy / 2 [set color color - 2]
+    if debug [show ("Aie")]
+    if energy <= 0 [
+      set dead? true
+      if [to-protect?] of target [set mission-failed? true]
+      die
+    ]
+
+    if any? out-convoi-link-neighbors [ ; out pointe vers la voiture suivante
+      let suivant out-convoi-link-neighbors
+      ; Tentative de communication avec le suivant
+      convoi-communicate "inform" suivant "separation"
+      ask suivant [
+        if show_messages [show incoming-queue]
+        ; Separation si bien recu
+        set msg get-message
+        if msg != "no_message" and get-content(msg) = "separation" [
+          separate target self
+        ]
+      ]
+    ]
+    if any? in-convoi-link-neighbors [ ; in pointe vers la voiture précédente
+      let prec in-convoi-link-neighbors
+      ; Tentative de communication avec le précédent
+      convoi-communicate "inform" prec "separation"
+      ask prec [
+        if show_messages [show incoming-queue]
+        ; Separation si bien recu
+        set msg get-message
+        if msg != "no_message" and get-content(msg) = "separation" [
+          separate self target
+        ]
+      ]
+    ]
+  ]
+end
+
+; Utilisé dans les cas de communication voiture-voiture d'un même convoi / voiture - voiture d'un autre convoi via son leader / leader convoi - leader drone
+to convoi-communicate [perf receiver content]
+  ; Verifie si le receiver est à portée
+  if any? receiver in-radius-nowrap convoi-communication [
+    let m create-message perf
+    set m add-receiver first [who] of receiver m
+    set m add-content content m
+    send m
+  ]
+end

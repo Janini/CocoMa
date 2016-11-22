@@ -1,0 +1,275 @@
+breed [drones drone]
+breed [bigrockets bigrocket]
+
+directed-link-breed [drone-links drone-link]
+
+bigrockets-own [
+  origin
+  cible
+]
+
+drones-own[
+  incoming-queue
+  beliefs
+  intentions
+  leader?
+  dead?
+  fuel
+  leader
+  finished?
+  speed maxdir
+  rayon-vision
+  dronepath
+  suivreConvoi?
+  aProteger
+  cpt-tick-drone
+]
+
+
+to setup-drones
+  if nb-drones > 0 [
+    ; base est la piste verticale : les drones décollent ici
+    let base patches with[pzcor = solAlt and pxcor >= 3 and pxcor < 5 and pycor >= 0 and pycor < 12]
+    let base-min-pxcor min [pxcor] of base
+    let base-max-pxcor max [pxcor] of base
+    let base-min-pycor min [pycor] of base
+    let base-max-pycor max [pycor] of base
+
+
+    create-drones nb-drones
+    ask drones [
+      set shape "airplane"
+      set color white
+
+      set speed 0.06 * simu-speed
+      set maxdir 10 * simu-speed
+      set finished? false
+      set fuel 60
+      set roll 0
+      set size 2
+      set pitch 90
+      set rayon-vision vision-drone
+      set heading 0
+      set leader? false
+      set dronepath []
+      set intentions []
+      add-intention "set pitch pitch - 10" "pitch <= 0"
+      add-intention "fd speed" "pzcor = mapAlt + rayon-vision"
+      set leader nobody
+      set suivreConvoi? false
+      set incoming-queue []
+      set aProteger nobody
+    ]
+
+    let first-drone min [who] of drones
+
+    ask drone first-drone [
+      set leader? true
+      set color orange
+      move-to patch base-max-pxcor base-max-pycor 1
+    ]
+
+    if nb-drones > 1 [
+      ask turtle-set sort-on [who] drones with [who > first-drone]
+      [
+        ; lien entre les drones
+        create-drone-link-to turtle (who - 1)
+  ; On les place sur la base comme les voitures du convoi
+  ifelse (who - 1) mod 2 = 0 [ set xcor base-min-pxcor ] [ set xcor base-max-pxcor ] ; a gauche ou a droite selon le nombre (pair ou impair respectivement)
+  ifelse (first-drone mod 2 = 0) [ set ycor base-max-pycor - (floor ((who - first-drone) / 2) / (nb-drones / 2) * (base-max-pycor - base-min-pycor)) ] ; d'une rangee de plus en plus basse toutes les deux voitures
+  [ set ycor base-max-pycor - (floor ((who - first-drone + 1) / 2) / (nb-drones / 2) * (base-max-pycor - base-min-pycor)) ]
+  set zcor solAlt
+
+      ]
+    ]
+  ]
+end
+
+
+to drone-communicate [perf receiver content]
+  ; Verifie si le receiver est à portée
+  if any? receiver in-radius-nowrap drone-communication [
+    let m create-message perf
+    set m add-receiver first [who] of receiver m
+    set m add-content content m
+    send m
+  ]
+end
+
+to drone-think
+  ; décollage et atténuation
+  let fin-decollage? false
+  ask drones [
+    ifelse get-intentions != [] [ execute-intentions ] [ set fin-decollage? true ]
+  ]
+  if not fin-decollage? [ stop ]
+  observe-drone
+end
+
+
+to move-drone-alea [drone]
+  ask drone [ fd speed ]
+end
+
+
+;Le leader drone suit une voiture leader
+to follow-convoi [car]
+  ;Calcul du chemin pour survoler le leader convoi
+  foreach sort-on [who] turtle-set drones with [leader? and suivreConvoi?] [
+    let patchConvoi [patch-here] of car
+    set patchConvoi patch [pxcor] of patchConvoi [pycor] of patchConvoi [pzcor] of ?
+    let path plan-astar ([patch-here] of ?) (patchConvoi) false
+    if path = [] [ask ? [ set dronepath [] ] stop ]
+   ; foreach path [ ask ? [ set pcolor pink] ]
+    ;Le leader drone suit ce chemin
+    ask ? [
+      if dronepath = [] [set dronepath path]
+      let next first dronepath
+      ifelse next != patch-here [
+        set heading towards-nowrap next
+        if not any? other drones-on patch-ahead 1 [fd speed]
+      ][ set dronepath remove-item 0 dronepath ]
+    ]
+  ]
+end
+
+; Les drones non-leader suivent le drone devant eux
+to move-drone [goal]
+  let headingFlag heading
+  set headingFlag (towards-nowrap goal)
+  let dirCorrection subtract-headings headingFlag heading
+  ; Arrondissement de l'angle (on ne veut pas faire de micro tournant)
+  set dirCorrection precision dirCorrection 2
+  ; Limite de l'angle, pour que ce soit plus realiste (la voiture ne peut pas faire un demi-tour sur place!)
+  ifelse dirCorrection > maxdir [ ; limite a droite
+    set dirCorrection maxdir
+  ]
+  [
+    if dirCorrection < maxdir * -1 [ ; limite a gauche
+      set dirCorrection maxdir * -1
+    ]
+  ]
+  ; On tourne
+  rt dirCorrection
+  set pitch [pitch] of goal
+  let tmp-speed speed
+  if any? out-drone-link-neighbors [
+    if distance-nowrap one-of out-drone-link-neighbors < 2.1 [
+      set tmp-speed tmp-speed / 20
+    ]
+    if distance-nowrap one-of out-drone-link-neighbors < 1.9 [
+      set tmp-speed 0
+    ]
+  ]
+    fd tmp-speed ; Avance
+end
+
+
+to observe-drone
+  let car nobody
+  let target nobody
+  let msg "no_message"
+  gest-bigrockets
+  foreach sort-on [who] turtle-set drones with [leader?] [
+    let vision no-patches
+    ask ? [
+      ; Plus un drone est haut, plus sa zone de vision au sol augmente
+      let alt [zcor] of self
+      set vision patch [xcor] of self [ycor] of self solAlt
+      ask vision [ set vision patches in-radius-nowrap ([rayon-vision] of ? + alt) with [pzcor = solAlt] ]
+      ;ask vision [set pcolor pink]
+
+      if any? convois-on vision [
+        ; Vérifie dans le champ de vision s'il y a une voiture leader qui n'est pas suivie
+        set car turtle-set convois-on vision
+        set car car with [ leader? and not finished? ]
+        set car min-one-of car [distance self]
+
+        ; S'il y a bien un leader "libre", on le suit
+        ifelse car != nobody [
+          ; Si le drone ne protège personne, informe le leader qu'il compte le suivre
+          if aProteger = nobody [
+            drone-communicate "inform" turtle-set car "Je te suis !"
+            ; Si reception de OK, je le suis
+            show incoming-queue
+            set msg get-message
+            if msg != "no_message" and get-content(msg) = "OK" [ set suivreConvoi? true set aProteger car ]
+          ]
+        ] [ set suivreConvoi? false set aProteger nobody ]
+      ]
+
+      ; Le drone tente de tuer l'ennemi le plus proche
+      ; Si le drone suit un convoi leader, l'avertit des emplacements des ennemis
+      if any? enemies-on vision [
+        set target min-one-of turtle-set enemies-on vision [distance self]
+        if suivreConvoi? [
+          show (word "Je dois avertir " aProteger)
+          drone-communicate "inform" turtle-set aProteger (word "Ennemi en " [patch-here] of target)
+        ]
+        show (word "Destruction de " target)
+        if target != nobody  [ ask ? [ attack-drone target ] ]
+      ]
+    ]
+
+    ; Je suis le leader à proteger s'il y en a un. Sinon, mouvement aléatoire
+    ifelse [suivreConvoi?] of ? [follow-convoi car ] [ ask ? [ set dronepath [] set aProteger nobody  move-drone-alea ? ] ]
+  ]
+
+  ; Les autres drones suivent leur suivant
+  ask drones with [not leader?] [
+    ifelse any? my-out-drone-links [ move-drone (one-of out-drone-link-neighbors) ]
+      [
+        set leader? true
+        set color orange
+      ]
+  ]
+end
+
+
+to attack-drone [target] ; Le drone tire sur la cible
+  if ticks > cpt-tick-drone + 10 [
+    hatch-bigrockets 1 [ ; Création de la balle
+      no-display
+      set size 0.7
+      ;setxyz xcor ycor (zcor - 0.40) ; Part de l'ennemi
+      set color black
+      display
+      face-nowrap target
+      let angle towards-nowrap target ; angle pour se tourner vers la cible
+      set heading angle
+      set origin myself
+      set cible target
+      ; L'ennemi (origin) ne peut tirer que tous les cpt-tick-enemy ticks
+      ask origin [set cpt-tick-drone ticks]
+    ]
+  ]
+end
+
+
+to gest-bigrockets
+  ask bigrockets [
+    let touch? false
+    ; Continue d'avancer tant que la cible n'est pas atteinte et dans la portée de l'agent
+    fd 0.3
+    if zcor < solAlt [ set shape "fire" set size 1 wait 0.2 die ] ; Explose sur le sol
+    if [hangar?] of patch-here or [base?] of patch-here [ set shape "fire" set size 1 wait 0.2 die ]
+    if cible != nobody [
+      ask bigrockets-on [ patches in-radius-nowrap 1 ] of cible [
+        set touch? true
+        set shape "fire"
+        set size 1.2
+        wait 0.2
+        if [breed] of cible = enemies [ enemy-touched cible ]
+        die ; Si la balle atteint la cible
+      ]
+    ]
+  ]
+end
+
+
+to drone-touched [target]
+  ask target [
+    set dead? true
+    die
+  ]
+end

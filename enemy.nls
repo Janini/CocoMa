@@ -1,0 +1,184 @@
+breed [enemies enemy]
+breed [rockets rocket]
+directed-link-breed [enemies-links enemy-link]
+
+rockets-own [
+  origin
+  cible
+]
+
+enemies-own[
+  incoming-queue
+  dead?
+  speed maxdir ; maximal speed of a car, and max angle
+  last-send-time ; communication historical time-stamp
+  rayon-vision ; rayon de vision des ennemis
+  approach?
+  mytarget
+  mypath
+  cpt-tick-enemy ; L'ennemi ne peut tirer que tous les 10 ticks au moins
+]
+
+
+to setup-enemies
+  if nb-enemies > 0 [
+    create-enemies nb-enemies
+    ask enemies [
+      set shape "car"
+      set color red
+
+      ; Init vars enemies
+      set speed 0.05 * simu-speed
+      set maxdir 10 * simu-speed
+      set roll 0
+      set pitch 0
+      set approach? false
+      set dead? false
+      set mytarget nobody
+      set mypath []
+      set rayon-vision vision-enemy
+      set heading one-of [ 0 90 180 270 ] ; Dans une direction aléatoire
+      set cpt-tick-enemy 0
+
+    ]
+
+    ask turtle-set enemies [
+      let rand one-of (patches with [not hangar? and pzcor = solAlt and not obstacle? and not base? and not any? turtles-here])
+      setxy [pxcor] of rand [pycor] of rand ; les ennemis n'apparaissent pas sur un obstacle
+      set zcor solAlt
+
+    ]
+  ]
+end
+
+
+to move-enemy
+  ask enemies [
+    if not approach? or mytarget = nobody [
+      ; Mouvement aléatoire
+      if random-float 1 <= 0.08 [ ;Probabilité de changer de direction
+        let pos one-of neighbors4 with
+        [ abs (pxcor - [pxcor] of myself) <= 1
+          and abs (pycor - [pycor] of myself) <= 1
+        and not obstacle?
+        and not base?
+        and not any? other convois-here
+        ]
+        if pos != nobody [
+          face pos ; Je me tourne vers une case voisine envisageable
+        ]
+      ]
+
+      if (not [obstacle?] of patch-ahead 1 ; Ne roule pas dans l'eau/Sur la montagne
+        and not any? other turtles-on patch-ahead 1 ; Ne va pas sur la même case qu'un autre agent
+                                                    ; Pas d'effets de bord
+        and abs ([pxcor] of patch-ahead 1 - [pxcor] of self) <= 1
+        and abs ([pycor] of patch-ahead 1 - [pycor] of self) <= 1
+        and not [base?] of patch-ahead 1
+        and not [hangar?] of patch-ahead 1)[fd speed] ; Avance
+    ] observe-enemy  ; regarde autour de lui dans un rayon de rayon-vision
+  ]
+
+  foreach sort-on [who] turtle-set enemies with [approach?]
+  [ approach ?]
+end
+
+
+to observe-enemy ; Agit en fonction de l'agent présent dans son champ de vision
+  gest-rockets
+  if any? convois in-cone-nowrap rayon-vision 180 with [pzcor = solAlt and not hangar? and not base?] [
+
+    ;show (word "Je vois " count convois in-radius-nowrap rayon-vision " voiture(s) du convoi")
+    let target min-one-of convois in-cone-nowrap rayon-vision 180 with [pzcor = solAlt and not hangar? and not base?] [distance-nowrap myself] ; cible la plus proche
+    let l [patches in-radius-nowrap portee-enemy with [pzcor = solAlt]] of target
+    set l l with [not obstacle?]
+    set mytarget min-one-of l [distance-nowrap myself]
+    ; Verifie si sa cible est atteignable
+    ifelse (distance-nowrap target <= portee-enemy)
+      [set heading towards-nowrap target]; attack-enemy(target)]
+      [ set approach? true ]
+  ]
+  if any? drones in-radius-nowrap rayon-vision [
+    let target min-one-of drones in-radius-nowrap rayon-vision [distance-nowrap myself] ; cible la plus proche
+    ;ask target [set color yellow]
+    ; Verifie si sa cible est atteignable
+   ; if (distance-nowrap target <= portee-enemy)  [attack-enemy(target)]
+
+  ]
+  ;Après - if any? enemies in-radius-nowrap rayon-vision [ communiquer ]
+end
+
+
+to attack-enemy [target] ; L'ennemi tire sur la cible
+  if ticks > cpt-tick-enemy + 10 [
+    hatch-rockets 1 [ ; Création de la balle
+      no-display
+      set size 0.3
+      setxyz xcor ycor (zcor - 0.40) ; Part de l'ennemi
+      set color red
+      display
+      face-nowrap target
+      let angle towards-nowrap target ; angle pour se tourner vers la cible
+      ; Probabilité de rater son tir
+      if random-float 1.0 <= awkwardness [ set angle angle + 20 ]
+      set heading angle
+      set origin myself
+      set cible target
+      ; L'ennemi (origin) ne peut tirer que tous les cpt-tick-enemy ticks
+      ask origin [set cpt-tick-enemy ticks]
+    ]
+  ]
+end
+
+
+to gest-rockets
+  ask rockets [
+    let touch? false
+    ; Il se peut que l'ennemi ait tiré plusieurs balles mais que la cible meure entre temps. Les balles explosent dans le vide
+    if cible = nobody [ set shape "fire" set size 1 wait 0.2 die]
+    ; Continue d'avancer tant que la cible n'est pas atteinte et dans la portée de l'agent
+    fd 0.3
+    ;while [ any? (turtle-set origin) in-radius-nowrap portee-enemy and not any? drones-on patch-here][ fd 0.5 ]
+    if distance-nowrap [patch-here] of origin > portee-enemy [ set shape "fire" set size 1 wait 0.2 die ] ; Disparait si hors de portée ou touche un obstacle
+    if [hangar?] of patch-here or [base?] of patch-here [ set shape "fire" set size 1 wait 0.2 die ]
+   ; on teste dans le voisinage pour un drone car il est plus dur à atteindre (déplacement sur 3 axes)
+    if member? patch-here [patches in-radius-nowrap 1] of cible [
+      ask rockets-on [patches in-radius-nowrap 1] of cible [
+        set touch? true
+        set shape "fire"
+        set size 1.2
+        wait 0.2
+        ifelse [breed] of cible = convois [ convoi-touched cible ] [ drone-touched cible ]
+        die ] ; Si la balle atteint la cible
+    ]
+  ]
+end
+
+
+; Cas où la cible est hors de portée d'un ennemi - il se rapproche
+to approach [ennemi]
+  let path plan-astar ([patch-here] of ennemi) ([mytarget] of ennemi) false;]
+  ; calcul du plus court chemin vers la cible ?
+  ; Si pas de chemin, l'ennemi abandonne
+  if path = [] [ask ennemi [set approach? false set mypath [] set mytarget nobody] stop]
+  ; S'il y a un chemin et que l'ennemi n'en a pas, il le suit
+  ask ennemi [
+    if mypath = [] [set mypath path]
+    ; foreach mypath [ask ? [set pcolor pink]]
+    let next first mypath
+    if next != patch-here [
+      set heading towards-nowrap next
+      set pitch 0
+      if not any? other turtles-on patch-ahead 1 [fd speed]
+    ]
+    if patch-here = next [ set mypath remove-item 0 mypath ]
+  ]
+end
+
+
+to enemy-touched [target]
+  ask target [
+    set dead? true
+    die
+  ]
+end
